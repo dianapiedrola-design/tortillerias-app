@@ -32,17 +32,31 @@ def build_buscarareaact_url(cve_ent, cve_mun="0", cve_loc="0",
     return base + path
 
 
-def fetch_json(url, timeout=10):
-    try:
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.Timeout:
-        st.warning("⚠️ La solicitud está tardando mucho. Reintentando...")
-        return None
-    except Exception as e:
-        st.error(f"Error en la solicitud: {str(e)}")
-        return None
+def fetch_json(url, timeout=30, max_retries=3):
+    """Realiza petición con reintentos automáticos"""
+    for intento in range(max_retries):
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            return data
+        except requests.exceptions.Timeout:
+            if intento < max_retries - 1:
+                time.sleep(2)  # Esperar 2 segundos antes de reintentar
+                continue
+            else:
+                return None
+        except requests.exceptions.RequestException as e:
+            if intento < max_retries - 1:
+                time.sleep(2)
+                continue
+            else:
+                st.error(f"Error después de {max_retries} intentos: {str(e)}")
+                return None
+        except Exception as e:
+            st.error(f"Error inesperado: {str(e)}")
+            return None
+    return None
 
 
 def parse_denue_item(item):
@@ -97,6 +111,8 @@ def paginate_buscarareaact(cve_ent, cve_mun, cve_loc, nombre="tortillería",
     """
     results = []
     pos_ini = 1
+    intentos_fallidos = 0
+    max_intentos_fallidos = 3
     
     for page in range(max_pages):
         if progress_bar:
@@ -105,9 +121,16 @@ def paginate_buscarareaact(cve_ent, cve_mun, cve_loc, nombre="tortillería",
         
         pos_fin = pos_ini + page_size - 1
         url = build_buscarareaact_url(cve_ent, cve_mun, cve_loc, nombre, pos_ini, pos_fin)
-        data = fetch_json(url, timeout=15)
+        data = fetch_json(url, timeout=30, max_retries=3)
         
-        if not data:
+        if data is None:
+            intentos_fallidos += 1
+            if intentos_fallidos >= max_intentos_fallidos:
+                st.warning(f"⚠️ La API no responde después de varios intentos. Se obtuvieron {len(results)} resultados hasta ahora.")
+                break
+            continue
+        
+        if not data or len(data) == 0:
             break
             
         for item in data:
@@ -117,7 +140,7 @@ def paginate_buscarareaact(cve_ent, cve_mun, cve_loc, nombre="tortillería",
             break
             
         pos_ini = pos_fin + 1
-        time.sleep(0.3)  # Pequeña pausa para no saturar la API
+        time.sleep(1)  # Pausa más larga entre peticiones
     
     return results
 
@@ -195,6 +218,16 @@ with st.sidebar:
     
     # Botón de búsqueda
     buscar = st.button("🔍 Buscar Tortillerías", type="primary", use_container_width=True)
+    
+    # Botón de prueba
+    if st.button("🧪 Probar conexión con API", use_container_width=True):
+        with st.spinner("Probando conexión..."):
+            test_url = build_buscarareaact_url("09", "0", "0", "tortillería", 1, 5)
+            test_data = fetch_json(test_url, timeout=15, max_retries=1)
+            if test_data:
+                st.success(f"✅ Conexión exitosa! Se obtuvieron {len(test_data)} resultados de prueba")
+            else:
+                st.error("❌ No se pudo conectar con la API del INEGI. Intenta más tarde.")
     
     st.markdown("---")
     st.markdown("**📊 Datos proporcionados por:**")
