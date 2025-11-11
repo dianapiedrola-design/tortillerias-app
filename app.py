@@ -3,6 +3,7 @@ import json
 import requests
 import folium
 from streamlit_folium import st_folium
+import time
 
 # =======================
 # CONFIGURACIÓN INICIAL
@@ -31,10 +32,17 @@ def build_buscarareaact_url(cve_ent, cve_mun="0", cve_loc="0",
     return base + path
 
 
-def fetch_json(url):
-    r = requests.get(url)
-    r.raise_for_status()
-    return r.json()
+def fetch_json(url, timeout=10):
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.Timeout:
+        st.warning("⚠️ La solicitud está tardando mucho. Reintentando...")
+        return None
+    except Exception as e:
+        st.error(f"Error en la solicitud: {str(e)}")
+        return None
 
 
 def parse_denue_item(item):
@@ -81,22 +89,36 @@ def parse_denue_item(item):
     return {"name": name, "address": address, "lat": lat, "lon": lon}
 
 
-@st.cache_data(show_spinner=False)
 def paginate_buscarareaact(cve_ent, cve_mun, cve_loc, nombre="tortillería",
-                           page_size=200, max_pages=50):
+                           page_size=200, max_pages=10, progress_bar=None):
+    """
+    Versión con límite de páginas y barra de progreso.
+    max_pages=10 significa máximo 2000 resultados (10 * 200)
+    """
     results = []
     pos_ini = 1
-    for _ in range(max_pages):
+    
+    for page in range(max_pages):
+        if progress_bar:
+            progress_bar.progress((page + 1) / max_pages, 
+                                text=f"Buscando... página {page + 1}/{max_pages}")
+        
         pos_fin = pos_ini + page_size - 1
         url = build_buscarareaact_url(cve_ent, cve_mun, cve_loc, nombre, pos_ini, pos_fin)
-        data = fetch_json(url)
+        data = fetch_json(url, timeout=15)
+        
         if not data:
             break
+            
         for item in data:
             results.append(parse_denue_item(item))
+        
         if len(data) < page_size:
             break
+            
         pos_ini = pos_fin + 1
+        time.sleep(0.3)  # Pequeña pausa para no saturar la API
+    
     return results
 
 
@@ -110,13 +132,17 @@ def create_map(rows):
     
     fmap = folium.Map(location=center, zoom_start=12)
     
-    for r in rows:
+    # Limitar a 500 marcadores para que no sea muy pesado
+    for r in rows[:500]:
         if r["lat"] and r["lon"]:
             folium.Marker(
                 [r["lat"], r["lon"]],
-                popup=f"<b>{r['name']}</b><br>{r['address']}",
+                popup=folium.Popup(f"<b>{r['name']}</b><br>{r['address']}", max_width=300),
                 tooltip=r['name']
             ).add_to(fmap)
+    
+    if len(rows) > 500:
+        st.info(f"ℹ️ Mostrando las primeras 500 tortillerías en el mapa de {len(rows)} encontradas")
     
     return fmap
 
@@ -129,6 +155,14 @@ st.set_page_config(
     page_icon="🌮",
     layout="wide"
 )
+
+# Inicializar session_state
+if 'results' not in st.session_state:
+    st.session_state.results = None
+if 'estado_anterior' not in st.session_state:
+    st.session_state.estado_anterior = None
+if 'municipio_anterior' not in st.session_state:
+    st.session_state.municipio_anterior = None
 
 st.title("🌮 Mapeador de Tortillerías en México")
 st.markdown("### Encuentra tortillerías cerca de ti usando datos del DENUE (INEGI)")
@@ -163,67 +197,98 @@ with st.sidebar:
     buscar = st.button("🔍 Buscar Tortillerías", type="primary", use_container_width=True)
     
     st.markdown("---")
-    st.markdown("**Datos proporcionados por:**")
+    st.markdown("**📊 Datos proporcionados por:**")
     st.markdown("DENUE - INEGI")
+    st.markdown("---")
+    st.caption("💡 Tip: La búsqueda está limitada a 2000 resultados para optimizar el rendimiento")
 
 # Contenido principal
 if buscar:
-    with st.spinner(f"Buscando tortillerías en {estado_seleccionado}..."):
-        try:
-            # Buscar tortillerías
-            results = paginate_buscarareaact(codigo_estado, codigo_municipio, "0")
-            
-            if len(results) == 0:
-                st.warning("No se encontraron tortillerías en esta ubicación. Intenta con otro estado o municipio.")
-            else:
-                # Mostrar métricas
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Tortillerías encontradas", len(results))
-                
-                with col2:
-                    con_coordenadas = sum(1 for r in results if r['lat'] and r['lon'])
-                    st.metric("Con ubicación", con_coordenadas)
-                
-                with col3:
-                    st.metric("Estado", estado_seleccionado)
-                
-                st.markdown("---")
-                
-                # Crear dos columnas: mapa y lista
-                col_mapa, col_lista = st.columns([2, 1])
-                
-                with col_mapa:
-                    st.subheader("📍 Mapa de ubicaciones")
-                    fmap = create_map(results)
-                    st_folium(fmap, width=700, height=500)
-                
-                with col_lista:
-                    st.subheader("📋 Lista de tortillerías")
-                    
-                    # Mostrar resultados en un contenedor con scroll
-                    for i, r in enumerate(results, 1):
-                        with st.expander(f"{i}. {r['name']}"):
-                            st.write(f"**Dirección:** {r['address']}")
-                            if r['lat'] and r['lon']:
-                                st.write(f"**Coordenadas:** {r['lat']}, {r['lon']}")
-                
-                # Botón de descarga
-                st.markdown("---")
-                st.subheader("💾 Descargar datos")
-                
-                json_str = json.dumps(results, ensure_ascii=False, indent=2)
-                st.download_button(
-                    label="📥 Descargar JSON",
-                    data=json_str,
-                    file_name=f"tortillerias_{estado_seleccionado.replace(' ', '_')}.json",
-                    mime="application/json"
+    # Verificar si es una nueva búsqueda
+    if (st.session_state.estado_anterior != estado_seleccionado or 
+        st.session_state.municipio_anterior != codigo_municipio):
+        
+        st.session_state.results = None
+        st.session_state.estado_anterior = estado_seleccionado
+        st.session_state.municipio_anterior = codigo_municipio
+    
+    if st.session_state.results is None:
+        progress_bar = st.progress(0, text="Iniciando búsqueda...")
+        
+        with st.spinner(f"Buscando tortillerías en {estado_seleccionado}..."):
+            try:
+                # Buscar tortillerías con límite
+                results = paginate_buscarareaact(
+                    codigo_estado, 
+                    codigo_municipio, 
+                    "0",
+                    max_pages=10,  # Máximo 2000 resultados
+                    progress_bar=progress_bar
                 )
                 
-        except Exception as e:
-            st.error(f"Error al buscar tortillerías: {str(e)}")
-            st.info("Verifica que los códigos sean correctos o intenta de nuevo más tarde.")
+                st.session_state.results = results
+                progress_bar.empty()
+                
+            except Exception as e:
+                st.error(f"Error al buscar tortillerías: {str(e)}")
+                st.info("Intenta de nuevo o selecciona otro estado.")
+                st.session_state.results = []
+
+# Mostrar resultados si existen
+if st.session_state.results is not None:
+    results = st.session_state.results
+    
+    if len(results) == 0:
+        st.warning("No se encontraron tortillerías en esta ubicación. Intenta con otro estado o municipio.")
+    else:
+        # Mostrar métricas
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Tortillerías encontradas", len(results))
+        
+        with col2:
+            con_coordenadas = sum(1 for r in results if r['lat'] and r['lon'])
+            st.metric("Con ubicación", con_coordenadas)
+        
+        with col3:
+            st.metric("Estado", st.session_state.estado_anterior)
+        
+        st.markdown("---")
+        
+        # Crear dos columnas: mapa y lista
+        col_mapa, col_lista = st.columns([2, 1])
+        
+        with col_mapa:
+            st.subheader("📍 Mapa de ubicaciones")
+            fmap = create_map(results)
+            # key única para evitar que desaparezca
+            st_folium(fmap, width=700, height=500, key="mapa_tortillerias", returned_objects=[])
+        
+        with col_lista:
+            st.subheader("📋 Lista de tortillerías")
+            
+            # Mostrar resultados en un contenedor con scroll
+            for i, r in enumerate(results[:100], 1):  # Limitar a 100 en la lista
+                with st.expander(f"{i}. {r['name']}"):
+                    st.write(f"**Dirección:** {r['address']}")
+                    if r['lat'] and r['lon']:
+                        st.write(f"**Coordenadas:** {r['lat']}, {r['lon']}")
+            
+            if len(results) > 100:
+                st.info(f"Mostrando las primeras 100 de {len(results)} tortillerías")
+        
+        # Botón de descarga
+        st.markdown("---")
+        st.subheader("💾 Descargar datos")
+        
+        json_str = json.dumps(results, ensure_ascii=False, indent=2)
+        st.download_button(
+            label="📥 Descargar JSON completo",
+            data=json_str,
+            file_name=f"tortillerias_{st.session_state.estado_anterior.replace(' ', '_')}.json",
+            mime="application/json"
+        )
 
 else:
     # Mensaje inicial
@@ -238,5 +303,8 @@ else:
         4. Explora el mapa interactivo y la lista de resultados
         5. Descarga los datos en formato JSON si lo necesitas
         
-        **Nota:** Los datos provienen del Directorio Estadístico Nacional de Unidades Económicas (DENUE) del INEGI.
+        **Nota:** 
+        - Los datos provienen del Directorio Estadístico Nacional de Unidades Económicas (DENUE) del INEGI
+        - La búsqueda está optimizada para mostrar hasta 2000 resultados
+        - El mapa muestra hasta 500 marcadores para mejor rendimiento
         """)
